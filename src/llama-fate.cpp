@@ -393,6 +393,7 @@ bool fate_system::init(const llama_model & model, ggml_backend_t backend, int32_
 }
 
 void fate_system::shutdown() {
+    print_stats();
     prefetch.shutdown();
     pool.free_pool();
 }
@@ -472,6 +473,14 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
     // --- pool lookup ---
     uint64_t key = fate_gpu_pool::make_key((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
     stats.accesses++;
+
+    // Periodic stats logging
+    if (stats.accesses.load() % 10000 == 0) {
+        uint64_t a = stats.accesses.load(), h = stats.hits.load();
+        float hr = a > 0 ? 100.0f * h / a : 0;
+        fprintf(stderr, "FATE: %llu accesses, %.1f%% hit rate, %llu prefetched\n",
+                (unsigned long long)a, hr, (unsigned long long)prefetch.prefetched.load());
+    }
 
     auto it = pool.key_to_slot.find(key);
     bool is_hit = (it != pool.key_to_slot.end());
