@@ -123,13 +123,21 @@ void fate_prefetcher::init(uint32_t nl, uint32_t ne, uint32_t neu, size_t max_ex
         return;
     }
 
-    // Allocate pinned staging buffer (one expert + padding)
-    staging_size = max_expert_bytes + 512;
-    staging = fate_prefetch_alloc_pinned(staging_size);
-    if (staging) {
-        fprintf(stderr, "FATE: pinned staging buffer: %.1fMB\n",
-                (float)staging_size / (1024*1024));
+    // Allocate pinned staging pool for async H2D when sources aren't pinned.
+    // Round-robin assignment eliminates the single-buffer race condition.
+    staging_buf_size = max_expert_bytes + 512;
+    uint32_t alloc_ok = 0;
+    for (uint32_t i = 0; i < N_STAGING; i++) {
+        staging_pool[i] = fate_prefetch_alloc_pinned(staging_buf_size);
+        if (staging_pool[i]) alloc_ok++;
     }
+    staging_idx_inline = 0;
+    staging_idx_worker = N_STAGING / 2;  // worker uses upper half
+    all_pinned = false;  // updated after pinning attempt in fate_system::init
+    fprintf(stderr, "FATE: pinned staging pool: %u/%u × %.1fMB = %.1fMB\n",
+            alloc_ok, N_STAGING,
+            (float)staging_buf_size / (1024*1024),
+            (float)alloc_ok * staging_buf_size / (1024*1024));
 
     quit = false;
     worker = std::thread([this]{ worker_fn(); });
@@ -149,7 +157,22 @@ void fate_prefetcher::worker_fn() {
             processing = true;
         }
         for (auto & j : work) {
-            fate_prefetch_h2d(stream, j.dst, j.src, j.n);
+            if (all_pinned) {
+                // Source memory is pinned — direct async H2D (fastest path)
+                fate_prefetch_h2d(stream, j.dst, j.src, j.n);
+            } else {
+                // Source not pinned — copy through staging pool for async DMA
+                uint32_t si = staging_idx_worker % N_STAGING;
+                if (si < N_STAGING / 2) si += N_STAGING / 2;  // stay in worker half [24..47]
+                void * sbuf = staging_pool[si];
+                if (sbuf && j.n <= staging_buf_size) {
+                    memcpy(sbuf, j.src, j.n);
+                    fate_prefetch_h2d(stream, j.dst, sbuf, j.n);
+                    staging_idx_worker++;
+                } else {
+                    fate_prefetch_h2d(stream, j.dst, j.src, j.n);
+                }
+            }
         }
         {
             std::lock_guard<std::mutex> lk(mtx);
@@ -250,7 +273,9 @@ void fate_prefetcher::shutdown() {
     fate_prefetch_sync(stream);
     fate_prefetch_stream_destroy(stream);
     stream = nullptr;
-    if (staging) { fate_prefetch_free_pinned(staging); staging = nullptr; }
+    for (uint32_t i = 0; i < N_STAGING; i++) {
+        if (staging_pool[i]) { fate_prefetch_free_pinned(staging_pool[i]); staging_pool[i] = nullptr; }
+    }
 }
 
 // ===========================================================================
@@ -341,9 +366,18 @@ bool fate_system::init(const llama_model & model, ggml_backend_t backend, int32_
     fprintf(stderr, "FATE: pinned %u/%u expert tensors for async prefetch\n",
             pinned, n_layer * 3);
 
+    // If all expert tensors are pinned, direct H2D is fastest — skip staging pool
+    bool all_pinned = (pinned == n_layer * 3);
+
     // Init prefetcher with CPU source pointers for every expert tensor.
     // Use nb[2] as the per-expert stride (matches the scheduler's expert_size).
     prefetch.init(n_layer, n_expert, n_expert_used, expert_bytes_max);
+    prefetch.all_pinned = all_pinned;
+    if (all_pinned) {
+        fprintf(stderr, "FATE: all tensors pinned — using direct async H2D (staging pool standby)\n");
+    } else {
+        fprintf(stderr, "FATE: not all tensors pinned — using staging pool for async H2D\n");
+    }
     for (uint32_t il = 0; il < n_layer && il < (uint32_t)model.layers.size(); il++) {
         const auto & lay = model.layers[il];
         if (lay.ffn_gate_exps && lay.ffn_gate_exps->data)
@@ -405,11 +439,20 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
                         size_t copy_n = ((uint32_t)eid < n_expert - 1)
                                       ? prefetch.sources[idx].padded_bytes
                                       : prefetch.sources[idx].expert_bytes;
-                        if (prefetch.staging && copy_n <= prefetch.staging_size) {
-                            memcpy(prefetch.staging, src, copy_n);
-                            fate_prefetch_h2d(prefetch.stream, dst_ptr, prefetch.staging, copy_n);
-                        } else {
+                        if (prefetch.all_pinned) {
+                            // Source memory is pinned — direct async H2D (fastest)
                             fate_prefetch_h2d(prefetch.stream, dst_ptr, src, copy_n);
+                        } else {
+                            // Use round-robin staging buffer for async H2D
+                            uint32_t si = prefetch.staging_idx_inline % (fate_prefetcher::N_STAGING / 2);
+                            void * sbuf = prefetch.staging_pool[si];
+                            if (sbuf && copy_n <= prefetch.staging_buf_size) {
+                                memcpy(sbuf, src, copy_n);
+                                fate_prefetch_h2d(prefetch.stream, dst_ptr, sbuf, copy_n);
+                                prefetch.staging_idx_inline++;
+                            } else {
+                                fate_prefetch_h2d(prefetch.stream, dst_ptr, src, copy_n);
+                            }
                         }
                         prefetch.prefetched++;
                     }

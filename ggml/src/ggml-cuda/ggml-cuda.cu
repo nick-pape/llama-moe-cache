@@ -5378,7 +5378,7 @@ bool fate_prefetch_pin_memory(const void * ptr, size_t size) {
     uintptr_t aligned_start = start & ~(page_size - 1);
     size_t aligned_size = (start + size - aligned_start + page_size - 1) & ~(page_size - 1);
     // Try several flags in order of preference
-    const unsigned int flags[] = { cudaHostRegisterDefault, cudaHostRegisterPortable, cudaHostRegisterMapped };
+    const unsigned int flags[] = { cudaHostRegisterDefault, cudaHostRegisterPortable, cudaHostRegisterMapped, cudaHostRegisterReadOnly };
     for (auto f : flags) {
         cudaError_t err = cudaHostRegister((void *)aligned_start, aligned_size, f);
         if (err == cudaSuccess) return true;

@@ -75,10 +75,14 @@ struct fate_gpu_pool {
 // ---------------------------------------------------------------------------
 struct fate_prefetcher {
     static const uint32_t N_KINDS = 4;
+    static const uint32_t N_STAGING = 48;  // round-robin pool (24 inline + 24 worker)
 
     void * stream = nullptr;
-    void * staging = nullptr;     // pinned staging buffer for async H2D
-    size_t staging_size = 0;
+    void * staging_pool[N_STAGING] = {};   // pinned staging buffers for async H2D
+    size_t staging_buf_size = 0;           // size of each buffer in pool
+    uint32_t staging_idx_inline = 0;       // round-robin counter for on_expert_copy path
+    uint32_t staging_idx_worker = 0;       // round-robin counter for worker_fn path
+    bool     all_pinned = false;           // true if cudaHostRegister succeeded for all tensors
 
     std::thread           worker;
     std::mutex            mtx;
