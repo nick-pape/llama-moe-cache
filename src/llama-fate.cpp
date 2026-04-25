@@ -415,53 +415,8 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
     if (layer < 0 || kind < 0 || (uint32_t)layer >= n_layer) return false;
     if (!pool.pool_tensor) return false;
 
-    // --- layer transition: prefetch predicted experts for the next layer ---
+    // --- layer transition: track experts (prefetch disabled for benchmarking) ---
     if (layer != prefetch.last_layer) {
-        if (prefetch.last_layer >= 0 && prefetch.stream) {
-            uint32_t prev_l = (uint32_t)prefetch.last_layer;
-            uint32_t next_l = (uint32_t)layer;
-            if (next_l < n_layer) {
-                std::unordered_set<int32_t> predicted;
-                for (int32_t e : prefetch.cur[prev_l]) predicted.insert(e);
-                if (next_l < (uint32_t)prefetch.prev.size())
-                    for (int32_t e : prefetch.prev[next_l]) predicted.insert(e);
-
-                for (int32_t eid : predicted) {
-                    for (uint32_t k = 0; k < fate_prefetcher::N_KINDS; k++) {
-                        uint32_t idx = next_l * fate_prefetcher::N_KINDS + k;
-                        if (idx >= prefetch.sources.size() || !prefetch.sources[idx].base) continue;
-                        uint64_t key = fate_gpu_pool::make_key(next_l, k, (uint32_t)eid);
-                        if (pool.key_to_slot.count(key)) continue;
-                        int32_t slot = pool.find_or_alloc(key);
-                        if (slot < 0) continue;
-                        void * dst_ptr = pool.slot_device_ptr((uint32_t)slot);
-                        const void * src = (const char *)prefetch.sources[idx].base
-                                           + (size_t)eid * prefetch.sources[idx].expert_bytes;
-                        size_t copy_n = ((uint32_t)eid < n_expert - 1)
-                                      ? prefetch.sources[idx].padded_bytes
-                                      : prefetch.sources[idx].expert_bytes;
-                        if (prefetch.all_pinned) {
-                            // Source memory is pinned — direct async H2D (fastest)
-                            fate_prefetch_h2d(prefetch.stream, dst_ptr, src, copy_n);
-                        } else {
-                            // Use round-robin staging buffer for async H2D
-                            uint32_t si = prefetch.staging_idx_inline % (fate_prefetcher::N_STAGING / 2);
-                            void * sbuf = prefetch.staging_pool[si];
-                            if (sbuf && copy_n <= prefetch.staging_buf_size) {
-                                memcpy(sbuf, src, copy_n);
-                                fate_prefetch_h2d(prefetch.stream, dst_ptr, sbuf, copy_n);
-                                prefetch.staging_idx_inline++;
-                            } else {
-                                fate_prefetch_h2d(prefetch.stream, dst_ptr, src, copy_n);
-                            }
-                        }
-                        prefetch.prefetched++;
-                    }
-                }
-            }
-            fate_prefetch_insert_barrier((void *)backend, prefetch.stream);
-        }
-
         if (layer < prefetch.last_layer || prefetch.last_layer < 0) {
             prefetch.on_token_start(pool);
         }
