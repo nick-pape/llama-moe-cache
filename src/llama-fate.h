@@ -110,7 +110,7 @@ struct fate_system {
 
     uint64_t current_epoch = 0;
     int32_t  last_layer    = -1;
-    int32_t  warmup_remaining = 50;
+    int32_t  warmup_remaining = 100;
 
     struct {
         uint64_t accesses  = 0;
