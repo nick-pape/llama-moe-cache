@@ -5405,6 +5405,33 @@ void fate_prefetch_free_pinned(void * p) {
     if (p) cudaFreeHost(p);
 }
 
+// FATE v2 event tracking for async populate completion
+void * fate_event_create(void) {
+    cudaEvent_t event;
+    cudaError_t err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    if (err != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    return (void *)event;
+}
+
+bool fate_event_query(void * event) {
+    if (!event) return true;
+    cudaError_t err = cudaEventQuery((cudaEvent_t)event);
+    if (err == cudaSuccess) return true;
+    if (err == cudaErrorNotReady) { cudaGetLastError(); return false; }
+    cudaGetLastError();
+    return true;  // treat errors as completed to avoid stalling
+}
+
+void fate_event_record(void * event, void * stream) {
+    if (!event || !stream) return;
+    cudaEventRecord((cudaEvent_t)event, (cudaStream_t)stream);
+}
+
+void fate_event_destroy(void * event) {
+    if (!event) return;
+    cudaEventDestroy((cudaEvent_t)event);
+}
+
 } // extern "C"
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

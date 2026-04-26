@@ -1,4 +1,4 @@
-// llama-moe-cache — FATE: predictive expert caching for MoE inference
+// llama-moe-cache -- FATE v2: Late Cache + Static Pinning
 // Copyright (C) 2026 Ongun Manav
 //
 // This program is free software: you can redistribute it and/or modify
@@ -13,17 +13,14 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
-#include <mutex>
-#include <thread>
-#include <atomic>
-#include <condition_variable>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <algorithm>
 
 struct llama_model;
 
-// CUDA prefetch functions (implemented in ggml-cuda.cu)
+// CUDA functions (implemented in ggml-cuda.cu)
 extern "C" {
     void * fate_prefetch_stream_create(void);
     void   fate_prefetch_h2d(void * stream, void * dst, const void * src, size_t n);
@@ -35,10 +32,24 @@ extern "C" {
     void   fate_prefetch_free_pinned(void * p);
     void   fate_debug_d2h(void * dst, const void * src, size_t n);
     int    fate_debug_ptr_type(const void * ptr);
+    // v2 event tracking
+    void * fate_event_create(void);
+    bool   fate_event_query(void * event);
+    void   fate_event_record(void * event, void * stream);
+    void   fate_event_destroy(void * event);
 }
 
 // ---------------------------------------------------------------------------
-// GPU VRAM pool — dedicated persistent buffer for caching expert weights
+// Slot states for the GPU expert cache pool
+// ---------------------------------------------------------------------------
+enum class fate_slot_state : uint8_t {
+    EMPTY,    // Slot unoccupied
+    LOADING,  // Async H2D in progress -- NOT servable as hit
+    READY     // Data valid -- servable as D2D cache hit
+};
+
+// ---------------------------------------------------------------------------
+// GPU VRAM pool -- persistent buffer for caching expert weights
 // ---------------------------------------------------------------------------
 struct fate_gpu_pool {
     ggml_backend_buffer_t buffer      = nullptr;
@@ -48,16 +59,23 @@ struct fate_gpu_pool {
     uint32_t              n_slots     = 0;
 
     struct slot_info {
-        uint64_t key       = UINT64_MAX;
-        uint64_t last_used = 0;
+        uint64_t        key       = UINT64_MAX;
+        uint64_t        last_used = 0;
+        fate_slot_state state     = fate_slot_state::EMPTY;
+        bool            pinned    = false;
     };
     std::vector<slot_info> slots;
     std::unordered_map<uint64_t, uint32_t> key_to_slot;
-    uint64_t tick = 0;
 
     bool     init(ggml_backend_t backend, size_t slot_bytes, size_t target_mb);
     void     free_pool();
-    int32_t  find_or_alloc(uint64_t key);
+
+    // Returns slot index if key exists AND state == READY, else -1
+    int32_t  lookup(uint64_t key);
+
+    // Allocate slot for key, evicting LRU non-pinned/non-LOADING/non-recent slot
+    int32_t  find_or_alloc(uint64_t key, uint64_t current_epoch);
+
     void *   slot_device_ptr(uint32_t idx);
 
     static uint64_t make_key(uint32_t layer, uint32_t kind, uint32_t expert) {
@@ -66,82 +84,66 @@ struct fate_gpu_pool {
 };
 
 // ---------------------------------------------------------------------------
-// Background prefetch engine
+// Main FATE v2 system: Late Cache + Static Pinning
 //
-// Uses a separate CUDA stream + worker thread to overlap H2D expert copies
-// with GPU compute.  Two prediction strategies:
-//   1. Temporal:     previous token's experts for each layer
-//   2. Cross-layer:  current layer's experts predict next layer's experts
-// ---------------------------------------------------------------------------
-struct fate_prefetcher {
-    static const uint32_t N_KINDS = 4;
-    static const uint32_t N_STAGING = 48;  // round-robin pool (24 inline + 24 worker)
-
-    void * stream = nullptr;
-    void * staging_pool[N_STAGING] = {};   // pinned staging buffers for async H2D
-    size_t staging_buf_size = 0;           // size of each buffer in pool
-    uint32_t staging_idx_inline = 0;       // round-robin counter for on_expert_copy path
-    uint32_t staging_idx_worker = 0;       // round-robin counter for worker_fn path
-    bool     all_pinned = false;           // true if cudaHostRegister succeeded for all tensors
-
-    std::thread           worker;
-    std::mutex            mtx;
-    std::condition_variable cv;
-    std::condition_variable done_cv;
-    bool                  quit       = false;
-    bool                  has_jobs   = false;
-    bool                  processing = false;
-
-    struct job { void * dst; const void * src; size_t n; };
-    std::vector<job> jobs;
-
-    int32_t  last_layer = -1;
-    uint32_t n_layer = 0, n_expert = 0, n_expert_used = 0;
-
-    // expert selections: [layer] → set of expert ids
-    std::vector<std::vector<int32_t>> cur;
-    std::vector<std::vector<int32_t>> prev;
-
-    // CPU base pointers for merged expert tensors: [layer * N_KINDS + kind]
-    struct tensor_src {
-        const void * base = nullptr;
-        size_t expert_bytes = 0;
-        size_t padded_bytes = 0; // expert_bytes + 512 padding for non-last experts
-    };
-    std::vector<tensor_src> sources;
-
-    std::atomic<uint64_t> prefetched{0};
-
-    void init(uint32_t nl, uint32_t ne, uint32_t neu, size_t max_expert_bytes);
-    void register_src(uint32_t layer, uint32_t kind, const void * base, size_t eb);
-    void on_token_start(fate_gpu_pool & pool);
-    void on_expert(uint32_t layer, int32_t expert_id);
-    void on_layer_done(uint32_t layer, fate_gpu_pool & pool);
-    void sync();
-    void shutdown();
-
-private:
-    void submit(std::vector<job> && work);
-    void worker_fn();
-};
-
-// ---------------------------------------------------------------------------
-// Main FATE system
+// On HIT  (READY slot): D2D from pool, return true  (~2us)
+// On MISS:              record miss, return false    (vanilla H2D, zero penalty)
+// Between tokens:       async H2D for qualified misses (admission >= 2)
 // ---------------------------------------------------------------------------
 struct fate_system {
+    static const uint32_t N_KINDS = 4;
+
     uint32_t n_layer       = 0;
     uint32_t n_expert      = 0;
     uint32_t n_expert_used = 0;
     size_t   expert_bytes_max = 0;
 
     fate_gpu_pool    pool;
-    fate_prefetcher  prefetch;
     ggml_backend_t   gpu_backend = nullptr;
 
+    // CPU source pointers: [layer * N_KINDS + kind]
+    struct tensor_src {
+        const void * base         = nullptr;
+        size_t       expert_bytes = 0;
+    };
+    std::vector<tensor_src> sources;
+
+    // Prefetch stream + event for async H2D population
+    void * prefetch_stream     = nullptr;
+    void * populate_event      = nullptr;
+    bool   populate_in_flight  = false;
+    bool   all_pinned          = false;
+    std::vector<uint32_t> loading_slots;
+
+    // Missed expert records (per token, processed between tokens)
+    struct miss_record {
+        uint64_t key;
+        uint32_t layer;
+        uint32_t kind;
+        uint32_t expert_id;
+    };
+    std::vector<miss_record> missed_list;
+
+    // Access frequency for admission control (decayed, not cleared)
+    std::unordered_map<uint64_t, uint32_t> access_freq;
+    uint64_t freq_decay_counter = 0;
+
+    // Epoch (token/ubatch counter)
+    uint64_t current_epoch = 0;
+
+    // Token boundary detection
+    int32_t last_layer = -1;
+
+    // Static pinning
+    int32_t warmup_remaining = 50;
+
+    // Stats
     struct {
-        std::atomic<uint64_t> accesses{0};
-        std::atomic<uint64_t> hits{0};
-        std::atomic<uint64_t> misses{0};
+        uint64_t accesses  = 0;
+        uint64_t hits      = 0;
+        uint64_t misses    = 0;
+        uint64_t populates = 0;
+        uint64_t skipped   = 0;
     } stats;
 
     bool init(const llama_model & model, ggml_backend_t backend, int32_t cache_mb = 0);
@@ -153,6 +155,9 @@ struct fate_system {
                         int32_t expert_id, int64_t n_expert_total,
                         const char * tensor_name);
 
+    void on_token_start();
+    void populate_misses();
+    void pin_hot_experts();
     void print_stats() const;
 
     static int parse_layer(const char * name);
