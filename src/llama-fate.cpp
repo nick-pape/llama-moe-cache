@@ -279,51 +279,10 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
                                   const void * /*src_data*/, size_t offset, size_t size,
                                   int32_t expert_id, int64_t /*n_expert_total*/,
                                   const char * tensor_name) {
-    // Name cache: pointer-keyed O(1) lookup (tensor objects are persistent)
-    int layer, kind;
-    auto nc_it = name_cache.find(tensor_name);
-    if (nc_it != name_cache.end()) {
-        layer = nc_it->second.first;
-        kind  = nc_it->second.second;
-    } else {
-        layer = parse_layer(tensor_name);
-        kind  = parse_tensor_kind(tensor_name);
-        if (layer >= 0 && kind >= 0) {
-            name_cache[tensor_name] = {layer, kind};
-        }
-    }
-    if (layer < 0 || kind < 0 || (uint32_t)layer >= n_layer) return false;
-
-    // Detect token/ubatch boundary: layer goes backward -> new token
-    if (layer < last_layer || (last_layer < 0 && layer == 0)) {
-        on_token_start();
-    }
-    last_layer = layer;
-
-    uint64_t key = fate_gpu_pool::make_key((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
+    // DIAGNOSTIC: return true for everything = skip all expert copies (garbage output, measures compute-only speed)
     stats.accesses++;
-
-    // Flat array frequency bump (O(1), cache-friendly)
-    uint32_t fi = freq_index((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
-    if (fi < access_freq.size() && access_freq[fi] < 65535) {
-        access_freq[fi]++;
-    }
-
-    // Pool lookup -- only serve READY hits
-    int32_t slot = pool.lookup(key);
-    if (slot >= 0) {
-        // HIT: D2D from pool slot to compute buffer
-        stats.hits++;
-        void * slot_ptr = pool.slot_device_ptr((uint32_t)slot);
-        ggml_backend_tensor_set_async(backend, dst, slot_ptr, offset, size);
-        pool.slots[slot].last_used = current_epoch;
-        return true;
-    }
-
-    // MISS: record for later populate, return false for vanilla H2D
-    stats.misses++;
-    missed_list.push_back({key, (uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id});
-    return false;
+    stats.hits++;
+    return true;
 }
 
 // ===========================================================================
