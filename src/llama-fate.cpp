@@ -384,11 +384,6 @@ void fate_system::populate_misses() {
     if (missed_list.empty()) return;
     if (!prefetch_stream) { missed_list.clear(); return; }
 
-    // DIAGNOSTIC: disable populate to isolate PCIe contention
-    stats.skipped += missed_list.size();
-    missed_list.clear();
-    return;
-
     // If previous populate still in flight, drop misses (will re-record if needed)
     if (populate_in_flight) {
         stats.skipped += missed_list.size();
@@ -481,7 +476,7 @@ void fate_system::pin_hot_experts() {
     std::sort(candidates.begin(), candidates.end(),
               [](const pin_candidate & a, const pin_candidate & b) { return a.freq > b.freq; });
 
-    uint32_t pin_target = std::min((uint32_t)200, (uint32_t)candidates.size());
+    uint32_t pin_target = std::min((uint32_t)30, (uint32_t)candidates.size());
     uint32_t pinned = 0, loaded = 0;
 
     for (uint32_t i = 0; i < pin_target; i++) {
