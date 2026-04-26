@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <unordered_set>
 
 fate_system * g_fate = nullptr;
 
@@ -241,7 +242,8 @@ bool fate_system::init(const llama_model & model, ggml_backend_t backend, int32_
     // Reserve space for miss tracking
     missed_list.reserve(n_layer * n_expert_used * N_KINDS);
     loading_slots.reserve(256);
-    access_freq.reserve(n_layer * n_expert * N_KINDS / 4);
+    // Flat frequency array: O(1) indexed by (layer, kind, expert_id)
+    access_freq.resize(n_layer * N_KINDS * n_expert, 0);
 
     fprintf(stderr, "FATE v2: system initialized (%u cache slots, late-cache + static pinning)\n", pool.n_slots);
     return true;
@@ -277,8 +279,19 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
                                   const void * /*src_data*/, size_t offset, size_t size,
                                   int32_t expert_id, int64_t /*n_expert_total*/,
                                   const char * tensor_name) {
-    int layer = parse_layer(tensor_name);
-    int kind  = parse_tensor_kind(tensor_name);
+    // Name cache: pointer-keyed O(1) lookup (tensor objects are persistent)
+    int layer, kind;
+    auto nc_it = name_cache.find(tensor_name);
+    if (nc_it != name_cache.end()) {
+        layer = nc_it->second.first;
+        kind  = nc_it->second.second;
+    } else {
+        layer = parse_layer(tensor_name);
+        kind  = parse_tensor_kind(tensor_name);
+        if (layer >= 0 && kind >= 0) {
+            name_cache[tensor_name] = {layer, kind};
+        }
+    }
     if (layer < 0 || kind < 0 || (uint32_t)layer >= n_layer) return false;
 
     // Detect token/ubatch boundary: layer goes backward -> new token
@@ -290,12 +303,10 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
     uint64_t key = fate_gpu_pool::make_key((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
     stats.accesses++;
 
-    // Track access frequency (at most once per epoch per key)
-    auto freq_it = access_freq.find(key);
-    if (freq_it == access_freq.end()) {
-        access_freq[key] = 1;
-    } else {
-        freq_it->second++;
+    // Flat array frequency bump (O(1), cache-friendly)
+    uint32_t fi = freq_index((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
+    if (fi < access_freq.size() && access_freq[fi] < 65535) {
+        access_freq[fi]++;
     }
 
     // Pool lookup -- only serve READY hits
@@ -347,17 +358,10 @@ void fate_system::on_token_start() {
         }
     }
 
-    // Decay access frequency every 500 epochs
+    // Decay frequency every 500 tokens
     freq_decay_counter++;
     if (freq_decay_counter >= 500) {
-        for (auto & kv : access_freq) {
-            kv.second >>= 1;  // halve
-        }
-        // Remove entries that decayed to 0
-        for (auto it = access_freq.begin(); it != access_freq.end(); ) {
-            if (it->second == 0) it = access_freq.erase(it);
-            else ++it;
-        }
+        for (auto & v : access_freq) v >>= 1;
         freq_decay_counter = 0;
     }
 
@@ -397,9 +401,9 @@ void fate_system::populate_misses() {
         // Already in pool?
         if (pool.key_to_slot.count(m.key)) continue;
 
-        // Admission control: need 2+ accesses
-        auto freq_it = access_freq.find(m.key);
-        if (freq_it == access_freq.end() || freq_it->second < 2) {
+        // Admission: need 2+ accesses (flat array lookup)
+        uint32_t fi = freq_index(m.layer, m.kind, m.expert_id);
+        if (fi >= access_freq.size() || access_freq[fi] < 2) {
             stats.skipped++;
             continue;
         }
@@ -450,18 +454,34 @@ void fate_system::pin_hot_experts() {
         populate_in_flight = false;
     }
 
-    // Sort access_freq by frequency descending
-    std::vector<std::pair<uint64_t, uint32_t>> freq_vec(access_freq.begin(), access_freq.end());
-    std::sort(freq_vec.begin(), freq_vec.end(),
-              [](const auto & a, const auto & b) { return a.second > b.second; });
+    // Collect candidates from flat frequency array
+    struct pin_candidate { uint32_t layer; uint32_t kind; uint32_t eid; uint16_t freq; };
+    std::vector<pin_candidate> candidates;
+    candidates.reserve(1024);
 
-    uint32_t pin_target = std::min((uint32_t)30, (uint32_t)freq_vec.size());
+    for (uint32_t l = 0; l < n_layer; l++) {
+        for (uint32_t k = 0; k < N_KINDS; k++) {
+            uint32_t src_idx = l * N_KINDS + k;
+            if (src_idx >= sources.size() || !sources[src_idx].base) continue;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                uint32_t fi = freq_index(l, k, e);
+                if (fi < access_freq.size() && access_freq[fi] >= 3) {
+                    candidates.push_back({l, k, e, access_freq[fi]});
+                }
+            }
+        }
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const pin_candidate & a, const pin_candidate & b) { return a.freq > b.freq; });
+
+    uint32_t pin_target = std::min((uint32_t)30, (uint32_t)candidates.size());
     uint32_t pinned = 0, loaded = 0;
 
     for (uint32_t i = 0; i < pin_target; i++) {
-        uint64_t key = freq_vec[i].first;
+        auto & c = candidates[i];
+        uint64_t key = fate_gpu_pool::make_key(c.layer, c.kind, c.eid);
 
-        // Check if already in pool
         auto it = pool.key_to_slot.find(key);
         if (it != pool.key_to_slot.end()) {
             pool.slots[it->second].pinned = true;
@@ -470,25 +490,17 @@ void fate_system::pin_hot_experts() {
             continue;
         }
 
-        // Allocate slot and load
         int32_t slot = pool.find_or_alloc(key, current_epoch);
         if (slot < 0) continue;
 
         pool.slots[slot].pinned = true;
         pool.slots[slot].state = fate_slot_state::LOADING;
 
-        // Decode key -> (layer, kind, expert_id)
-        uint32_t k_layer = (key >> 16) & 0xFFFF;
-        uint32_t k_kind  = (key >> 8) & 0xFF;
-        uint32_t k_eid   = key & 0xFF;
-
-        uint32_t src_idx = k_layer * N_KINDS + k_kind;
-        if (src_idx >= sources.size() || !sources[src_idx].base) continue;
-
+        uint32_t src_idx = c.layer * N_KINDS + c.kind;
         void * dst = pool.slot_device_ptr((uint32_t)slot);
         size_t eb = sources[src_idx].expert_bytes;
-        const void * src = (const char *)sources[src_idx].base + (size_t)k_eid * eb;
-        size_t copy_n = (k_eid < n_expert - 1) ? eb + std::min(eb, (size_t)512) : eb;
+        const void * src = (const char *)sources[src_idx].base + (size_t)c.eid * eb;
+        size_t copy_n = (c.eid < n_expert - 1) ? eb + std::min(eb, (size_t)512) : eb;
 
         fate_prefetch_h2d(prefetch_stream, dst, src, copy_n);
         loaded++;
@@ -501,15 +513,13 @@ void fate_system::pin_hot_experts() {
     }
 
     // Mark all just-loaded pinned slots as READY
-    for (auto & kv : pool.key_to_slot) {
-        auto & s = pool.slots[kv.second];
-        if (s.pinned && s.state == fate_slot_state::LOADING) {
-            s.state = fate_slot_state::READY;
+    for (uint32_t i = 0; i < pool.n_slots; i++) {
+        if (pool.slots[i].pinned && pool.slots[i].state == fate_slot_state::LOADING) {
+            pool.slots[i].state = fate_slot_state::READY;
         }
     }
 
-    fprintf(stderr, "FATE v2: pinned %u hot experts (%u already cached, %u loaded)\n",
-            pinned, pinned - loaded, loaded);
+    fprintf(stderr, "FATE v2: pinned %u hot experts (%u loaded)\n", pinned, loaded);
 }
 
 // ===========================================================================
