@@ -342,7 +342,8 @@ bool fate_system::init(const llama_model & model, ggml_backend_t backend, int32_
     size_t padded_slot = expert_bytes_max + 512;
     uint32_t min_slots = n_layer * n_expert_used * 3;
     size_t min_mb = (size_t)min_slots * padded_slot / (1024*1024) + 64;
-    size_t target_mb = (cache_mb > 0) ? (size_t)cache_mb : std::max(min_mb, (size_t)4096);
+    // Use minimal pool for step-0 baseline (hook always returns false, pool unused)
+    size_t target_mb = (cache_mb > 0) ? (size_t)cache_mb : 128;
 
     fprintf(stderr, "FATE: working set = %u slots (%.0fMB), target = %zuMB\n",
             min_slots, (float)min_slots * padded_slot / (1024*1024), target_mb);
@@ -410,55 +411,11 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
                                   const void * src_data, size_t offset, size_t size,
                                   int32_t expert_id, int64_t /*n_expert_total*/,
                                   const char * tensor_name) {
-    int layer = parse_layer(tensor_name);
-    int kind  = parse_tensor_kind(tensor_name);
-    if (layer < 0 || kind < 0 || (uint32_t)layer >= n_layer) return false;
-    if (!pool.pool_tensor) return false;
-
-    // --- layer transition: track experts (prefetch disabled for benchmarking) ---
-    if (layer != prefetch.last_layer) {
-        if (layer < prefetch.last_layer || prefetch.last_layer < 0) {
-            prefetch.on_token_start(pool);
-        }
-        prefetch.last_layer = layer;
-    }
-
-    prefetch.on_expert((uint32_t)layer, expert_id);
-
-    // --- pool lookup ---
-    uint64_t key = fate_gpu_pool::make_key((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
-    stats.accesses++;
-
-    // Periodic stats logging
-    if (stats.accesses.load() % 10000 == 0) {
-        uint64_t a = stats.accesses.load(), h = stats.hits.load();
-        float hr = a > 0 ? 100.0f * h / a : 0;
-        fprintf(stderr, "FATE: %llu accesses, %.1f%% hit rate, %llu prefetched\n",
-                (unsigned long long)a, hr, (unsigned long long)prefetch.prefetched.load());
-    }
-
-    auto it = pool.key_to_slot.find(key);
-    bool is_hit = (it != pool.key_to_slot.end());
-
-    if (is_hit) {
-        stats.hits++;
-        pool.slots[it->second].last_used = ++pool.tick;
-        void * slot_ptr = pool.slot_device_ptr(it->second);
-        ggml_backend_tensor_set_async(backend, dst, slot_ptr, offset, size);
-    } else {
-        stats.misses++;
-        int32_t slot = pool.find_or_alloc(key);
-        if (slot >= 0) {
-            ggml_backend_tensor_set_async(backend, dst, src_data, offset, size);
-            ggml_backend_tensor_set_async(backend, pool.pool_tensor,
-                                           (const char *)dst->data + offset,
-                                           (size_t)slot * pool.slot_bytes, size);
-        } else {
-            ggml_backend_tensor_set_async(backend, dst, src_data, offset, size);
-        }
-    }
-
-    return true;
+    // Step 0: Always-false baseline — measures per-expert iteration overhead
+    // when hook is installed but does nothing. Vanilla H2D handles everything.
+    (void)backend; (void)dst; (void)src_data; (void)offset; (void)size;
+    (void)expert_id; (void)tensor_name;
+    return false;
 }
 
 // ===========================================================================
