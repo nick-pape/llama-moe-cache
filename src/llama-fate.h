@@ -14,7 +14,6 @@
 
 #include <cstdint>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -32,25 +31,18 @@ extern "C" {
     void   fate_prefetch_free_pinned(void * p);
     void   fate_debug_d2h(void * dst, const void * src, size_t n);
     int    fate_debug_ptr_type(const void * ptr);
-    // v2 event tracking
     void * fate_event_create(void);
     bool   fate_event_query(void * event);
     void   fate_event_record(void * event, void * stream);
     void   fate_event_destroy(void * event);
 }
 
-// ---------------------------------------------------------------------------
-// Slot states for the GPU expert cache pool
-// ---------------------------------------------------------------------------
 enum class fate_slot_state : uint8_t {
-    EMPTY,    // Slot unoccupied
-    LOADING,  // Async H2D in progress -- NOT servable as hit
-    READY     // Data valid -- servable as D2D cache hit
+    EMPTY,
+    LOADING,
+    READY
 };
 
-// ---------------------------------------------------------------------------
-// GPU VRAM pool -- persistent buffer for caching expert weights
-// ---------------------------------------------------------------------------
 struct fate_gpu_pool {
     ggml_backend_buffer_t buffer      = nullptr;
     ggml_context *        ctx         = nullptr;
@@ -69,13 +61,8 @@ struct fate_gpu_pool {
 
     bool     init(ggml_backend_t backend, size_t slot_bytes, size_t target_mb);
     void     free_pool();
-
-    // Returns slot index if key exists AND state == READY, else -1
     int32_t  lookup(uint64_t key);
-
-    // Allocate slot for key, evicting LRU non-pinned/non-LOADING/non-recent slot
     int32_t  find_or_alloc(uint64_t key, uint64_t current_epoch);
-
     void *   slot_device_ptr(uint32_t idx);
 
     static uint64_t make_key(uint32_t layer, uint32_t kind, uint32_t expert) {
@@ -83,13 +70,6 @@ struct fate_gpu_pool {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Main FATE v2 system: Late Cache + Static Pinning
-//
-// On HIT  (READY slot): D2D from pool, return true  (~2us)
-// On MISS:              record miss, return false    (vanilla H2D, zero penalty)
-// Between tokens:       async H2D for qualified misses (admission >= 2)
-// ---------------------------------------------------------------------------
 struct fate_system {
     static const uint32_t N_KINDS = 4;
 
@@ -101,21 +81,25 @@ struct fate_system {
     fate_gpu_pool    pool;
     ggml_backend_t   gpu_backend = nullptr;
 
-    // CPU source pointers: [layer * N_KINDS + kind]
     struct tensor_src {
         const void * base         = nullptr;
         size_t       expert_bytes = 0;
     };
     std::vector<tensor_src> sources;
 
-    // Prefetch stream + event for async H2D population
     void * prefetch_stream     = nullptr;
     void * populate_event      = nullptr;
     bool   populate_in_flight  = false;
     bool   all_pinned          = false;
     std::vector<uint32_t> loading_slots;
 
-    // Missed expert records (per token, processed between tokens)
+    // Name cache: tensor_name pointer -> (layer, kind)
+    std::unordered_map<const char *, std::pair<int, int>> name_cache;
+
+    // Flat access frequency: [layer * N_KINDS * n_expert + kind * n_expert + eid]
+    std::vector<uint16_t> access_freq;
+    uint64_t freq_decay_counter = 0;
+
     struct miss_record {
         uint64_t key;
         uint32_t layer;
@@ -124,20 +108,10 @@ struct fate_system {
     };
     std::vector<miss_record> missed_list;
 
-    // Access frequency for admission control (decayed, not cleared)
-    std::unordered_map<uint64_t, uint32_t> access_freq;
-    uint64_t freq_decay_counter = 0;
-
-    // Epoch (token/ubatch counter)
     uint64_t current_epoch = 0;
+    int32_t  last_layer    = -1;
+    int32_t  warmup_remaining = 50;
 
-    // Token boundary detection
-    int32_t last_layer = -1;
-
-    // Static pinning
-    int32_t warmup_remaining = 50;
-
-    // Stats
     struct {
         uint64_t accesses  = 0;
         uint64_t hits      = 0;
@@ -159,6 +133,10 @@ struct fate_system {
     void populate_misses();
     void pin_hot_experts();
     void print_stats() const;
+
+    inline uint32_t freq_index(uint32_t layer, uint32_t kind, uint32_t eid) const {
+        return layer * (N_KINDS * n_expert) + kind * n_expert + eid;
+    }
 
     static int parse_layer(const char * name);
     static int parse_tensor_kind(const char * name);
