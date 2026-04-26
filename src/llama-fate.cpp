@@ -279,10 +279,14 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
                                   const void * /*src_data*/, size_t offset, size_t size,
                                   int32_t expert_id, int64_t /*n_expert_total*/,
                                   const char * tensor_name) {
-    // DIAGNOSTIC: return true for everything = skip all expert copies (garbage output, measures compute-only speed)
+    // DIAGNOSTIC: skip even experts, H2D odd experts — test if H2D time scales linearly
     stats.accesses++;
-    stats.hits++;
-    return true;
+    if (expert_id % 2 == 0) {
+        stats.hits++;
+        return true;  // skip copy (garbage data, but measures timing)
+    }
+    stats.misses++;
+    return false;  // vanilla H2D
 }
 
 // ===========================================================================
