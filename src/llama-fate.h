@@ -35,6 +35,7 @@ extern "C" {
     bool   fate_event_query(void * event);
     void   fate_event_record(void * event, void * stream);
     void   fate_event_destroy(void * event);
+    void   fate_d2d_copy(void * backend_raw, void * dst, const void * src, size_t n);
 }
 
 enum class fate_slot_state : uint8_t {
@@ -110,7 +111,7 @@ struct fate_system {
 
     uint64_t current_epoch = 0;
     int32_t  last_layer    = -1;
-    int32_t  warmup_remaining = 100;
+    int32_t  warmup_remaining = 50;
 
     struct {
         uint64_t accesses  = 0;

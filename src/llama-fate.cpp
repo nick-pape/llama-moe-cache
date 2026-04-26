@@ -279,14 +279,52 @@ bool fate_system::on_expert_copy(ggml_backend_t backend,
                                   const void * /*src_data*/, size_t offset, size_t size,
                                   int32_t expert_id, int64_t /*n_expert_total*/,
                                   const char * tensor_name) {
-    // DIAGNOSTIC: skip even experts, H2D odd experts — test if H2D time scales linearly
-    stats.accesses++;
-    if (expert_id % 2 == 0) {
-        stats.hits++;
-        return true;  // skip copy (garbage data, but measures timing)
+    // Name cache: pointer-keyed O(1) lookup (tensor objects are persistent)
+    int layer, kind;
+    auto nc_it = name_cache.find(tensor_name);
+    if (nc_it != name_cache.end()) {
+        layer = nc_it->second.first;
+        kind  = nc_it->second.second;
+    } else {
+        layer = parse_layer(tensor_name);
+        kind  = parse_tensor_kind(tensor_name);
+        if (layer >= 0 && kind >= 0) {
+            name_cache[tensor_name] = {layer, kind};
+        }
     }
+    if (layer < 0 || kind < 0 || (uint32_t)layer >= n_layer) return false;
+
+    // Detect token/ubatch boundary: layer goes backward -> new token
+    if (layer < last_layer || (last_layer < 0 && layer == 0)) {
+        on_token_start();
+    }
+    last_layer = layer;
+
+    uint64_t key = fate_gpu_pool::make_key((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
+    stats.accesses++;
+
+    // Flat array frequency bump (O(1), cache-friendly)
+    uint32_t fi = freq_index((uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id);
+    if (fi < access_freq.size() && access_freq[fi] < 65535) {
+        access_freq[fi]++;
+    }
+
+    // Pool lookup -- only serve READY hits
+    int32_t slot = pool.lookup(key);
+    if (slot >= 0) {
+        // HIT: explicit D2D from pool slot to compute buffer
+        stats.hits++;
+        void * slot_ptr = pool.slot_device_ptr((uint32_t)slot);
+        void * dst_ptr = (char *)dst->data + offset;
+        fate_d2d_copy(backend, dst_ptr, slot_ptr, size);
+        pool.slots[slot].last_used = current_epoch;
+        return true;
+    }
+
+    // MISS: record for later populate, return false for vanilla H2D
     stats.misses++;
-    return false;  // vanilla H2D
+    missed_list.push_back({key, (uint32_t)layer, (uint32_t)kind, (uint32_t)expert_id});
+    return false;
 }
 
 // ===========================================================================
@@ -345,11 +383,6 @@ void fate_system::on_token_start() {
 void fate_system::populate_misses() {
     if (missed_list.empty()) return;
     if (!prefetch_stream) { missed_list.clear(); return; }
-
-    // DIAGNOSTIC: disable populate to test PCIe contention hypothesis
-    stats.skipped += missed_list.size();
-    missed_list.clear();
-    return;
 
     // If previous populate still in flight, drop misses (will re-record if needed)
     if (populate_in_flight) {
@@ -443,7 +476,7 @@ void fate_system::pin_hot_experts() {
     std::sort(candidates.begin(), candidates.end(),
               [](const pin_candidate & a, const pin_candidate & b) { return a.freq > b.freq; });
 
-    uint32_t pin_target = std::min((uint32_t)200, (uint32_t)candidates.size());
+    uint32_t pin_target = std::min((uint32_t)30, (uint32_t)candidates.size());
     uint32_t pinned = 0, loaded = 0;
 
     for (uint32_t i = 0; i < pin_target; i++) {

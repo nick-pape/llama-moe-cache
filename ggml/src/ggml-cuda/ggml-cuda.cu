@@ -5432,6 +5432,13 @@ void fate_event_destroy(void * event) {
     cudaEventDestroy((cudaEvent_t)event);
 }
 
+// D2D copy using explicit DeviceToDevice on a given backend's main stream
+void fate_d2d_copy(void * backend_raw, void * dst, const void * src, size_t n) {
+    ggml_backend_t backend = (ggml_backend_t)backend_raw;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *)backend->context;
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToDevice, ctx->stream()));
+}
+
 } // extern "C"
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
